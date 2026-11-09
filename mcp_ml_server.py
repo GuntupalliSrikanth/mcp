@@ -19,11 +19,10 @@ from typing import Any, Callable, Dict, Optional
 
 from pydantic import Field
 
-# The high-level server class is called MCPServer in MCP Python SDK 2.x and
-# FastMCP in 1.x. They share the same decorator API, so support both.
+# Support MCP Python SDK 1.x and 2.x.
 try:
     from mcp.server.mcpserver import MCPServer as _Server
-except ImportError:  # MCP Python SDK 1.x
+except ImportError:
     from mcp.server.fastmcp import FastMCP as _Server
 
 from parquet_store import append_audit_row, export_audit_copy
@@ -34,40 +33,78 @@ server = _Server("mcp-ml-agent")
 
 DEFAULT_RULE = "recall_then_precision_then_accuracy"
 
-# Shared argument definitions (shown to the client as the tool's input schema)
-TestSize = Field(default=0.2, gt=0, lt=1, description="Fraction of the data held out for testing.")
-RandomState = Field(default=42, description="Random seed for the train/test split.")
-KnnNeighbors = Field(default=5, ge=1, description="Number of neighbors for the KNN model.")
-RequestId = Field(default="unknown", description="Your own id for this call; recorded in the audit log.")
+# Shared argument definitions
+TestSize = Field(
+    default=0.2,
+    gt=0,
+    lt=1,
+    description="Fraction of the data held out for testing."
+)
+
+RandomState = Field(
+    default=42,
+    description="Random seed for the train/test split."
+)
+
+KnnNeighbors = Field(
+    default=5,
+    ge=1,
+    description="Number of neighbors for the KNN model."
+)
+
+RequestId = Field(
+    default="unknown",
+    description="Your own id for this call; recorded in the audit log."
+)
 
 
 def _log(row: Dict[str, Any]) -> None:
-    """Write an audit row without ever letting a logging failure break a tool."""
+    """Write an audit row without letting logging failures break a tool."""
     try:
         append_audit_row(row)
-    except Exception as e:  # pragma: no cover
-        print(f"[mcp-ml-agent] audit log write failed: {e}", file=sys.stderr)
+    except Exception as e:
+        print(
+            f"[mcp-ml-agent] audit log write failed: {e}",
+            file=sys.stderr
+        )
 
 
-def _run(tool: str, request_id: str, work: Callable[[], Dict[str, Any]],
-         audit: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None) -> Dict[str, Any]:
-    """
-    Run a tool body, log it, and return its result.
+def _run(
+    tool: str,
+    request_id: str,
+    work: Callable[[], Dict[str, Any]],
+    audit: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None
+) -> Dict[str, Any]:
+    """Execute a tool, log its result, and handle errors."""
 
-    On success, logs request_id, tool, status and any extra fields from
-    `audit(result)`. On failure, logs the error and returns
-    {"status": "error", "message": ...} instead of crashing the server.
-    """
     try:
         result = work()
-    except Exception as e:
-        _log({"request_id": request_id, "tool": tool, "status": "error", "error": str(e)})
-        return {"status": "error", "tool": tool, "message": str(e)}
 
-    row = {"request_id": request_id, "tool": tool, "status": result.get("status", "success")}
+    except Exception as e:
+        _log({
+            "request_id": request_id,
+            "tool": tool,
+            "status": "error",
+            "error": str(e)
+        })
+
+        return {
+            "status": "error",
+            "tool": tool,
+            "message": str(e)
+        }
+
+    row = {
+        "request_id": request_id,
+        "tool": tool,
+        "status": result.get("status", "success")
+    }
+
     if audit is not None:
         row.update(audit(result))
+
     _log(row)
+
     return result
 
 
@@ -81,9 +118,9 @@ def _metrics(e: ml.EvalResult) -> Dict[str, Any]:
     }
 
 
-# ---------------------------------------------------------------------------
-# Tools
-# ---------------------------------------------------------------------------
+# ============================================================
+# TOOL 1: TRAIN MODELS
+# ============================================================
 
 @server.tool()
 def train_models(
@@ -92,76 +129,155 @@ def train_models(
     knn_neighbors: int = KnnNeighbors,
     request_id: str = RequestId,
 ) -> Dict[str, Any]:
-    """Train Logistic Regression and KNN on the breast cancer dataset and export joblib artifacts."""
+
+    """Train Logistic Regression and KNN models."""
+
     return _run(
-        "train_models", request_id,
-        lambda: ml.train_and_export_all(test_size, random_state, knn_neighbors),
+        "train_models",
+        request_id,
+        lambda: ml.train_and_export_all(
+            test_size,
+            random_state,
+            knn_neighbors
+        ),
     )
 
 
+# ============================================================
+# TOOL 2: GET SAMPLE INPUT
+# ============================================================
+
 @server.tool()
 def get_sample_input(
-    index: int = Field(default=0, ge=0, description="Row of the held-out test set to return."),
+    index: int = Field(
+        default=0,
+        ge=0,
+        description="Row of the held-out test set to return."
+    ),
     test_size: float = TestSize,
     random_state: int = RandomState,
     request_id: str = RequestId,
 ) -> Dict[str, Any]:
-    """
-    Return one test-set patient as a ready-to-use `input_data` dictionary for
-    the predict tools, along with that patient's true diagnosis.
-    """
+
+    """Return a test patient with input features and true diagnosis."""
+
     def work():
-        sample = ml.get_sample_input(index, test_size, random_state)
-        return {"status": "success", **sample}
+        sample = ml.get_sample_input(
+            index,
+            test_size,
+            random_state
+        )
+
+        return {
+            "status": "success",
+            **sample
+        }
 
     return _run(
-        "get_sample_input", request_id, work,
-        lambda r: {"sample_index": r["index"], "true_class": r["true_class"]},
+        "get_sample_input",
+        request_id,
+        work,
+        lambda r: {
+            "sample_index": r["index"],
+            "true_class": r["true_class"]
+        },
     )
 
 
-def _predict(tool: str, model_name: str, input_data: Dict[str, Any], request_id: str) -> Dict[str, Any]:
+def _predict(
+    tool: str,
+    model_name: str,
+    input_data: Dict[str, Any],
+    request_id: str
+) -> Dict[str, Any]:
+
     def work():
+
         model = ml.load_model(model_name)
-        pred = ml.predict_with_model(model, input_data)
-        return {"status": "success", "tool": tool, "model_used": model_name, "result": pred}
+
+        pred = ml.predict_with_model(
+            model,
+            input_data
+        )
+
+        return {
+            "status": "success",
+            "tool": tool,
+            "model_used": model_name,
+            "result": pred
+        }
 
     return _run(
-        tool, request_id, work,
+        tool,
+        request_id,
+        work,
         lambda r: {
             "model_used": model_name,
             "prediction": r["result"]["prediction"],
             "predicted_class": r["result"]["predicted_class"],
             "confidence": r["result"]["confidence"],
-            "input_json": json.dumps(input_data, sort_keys=True),
+            "input_json": json.dumps(
+                input_data,
+                sort_keys=True
+            ),
         },
     )
 
 
 INPUT_DATA_DESCRIPTION = (
-    "Feature dictionary with all 30 breast cancer features as numbers, keyed by "
-    "their exact names (e.g. 'mean radius', 'worst area'). Use get_sample_input "
-    "to get a valid example."
+    "Feature dictionary with all 30 breast cancer features as numbers, "
+    "keyed by their exact names (e.g. 'mean radius', 'worst area'). "
+    "Use get_sample_input to get a valid example."
 )
 
 
+# ============================================================
+# TOOL 3: LOGISTIC REGRESSION PREDICTION
+# ============================================================
+
 @server.tool()
 def predict_logistic_regression(
-    input_data: Dict[str, Any] = Field(description=INPUT_DATA_DESCRIPTION),
+    input_data: Dict[str, Any] = Field(
+        description=INPUT_DATA_DESCRIPTION
+    ),
     request_id: str = RequestId,
 ) -> Dict[str, Any]:
-    """Predict malignant (0) or benign (1) using the saved Logistic Regression model."""
-    return _predict("predict_logistic_regression", "logistic_regression", input_data, request_id)
 
+    """Predict malignant or benign using Logistic Regression."""
+
+    return _predict(
+        "predict_logistic_regression",
+        "logistic_regression",
+        input_data,
+        request_id
+    )
+
+
+# ============================================================
+# TOOL 4: KNN PREDICTION
+# ============================================================
 
 @server.tool()
 def predict_knn(
-    input_data: Dict[str, Any] = Field(description=INPUT_DATA_DESCRIPTION),
+    input_data: Dict[str, Any] = Field(
+        description=INPUT_DATA_DESCRIPTION
+    ),
     request_id: str = RequestId,
 ) -> Dict[str, Any]:
-    """Predict malignant (0) or benign (1) using the saved KNN model."""
-    return _predict("predict_knn", "knn", input_data, request_id)
 
+    """Predict malignant or benign using KNN."""
+
+    return _predict(
+        "predict_knn",
+        "knn",
+        input_data,
+        request_id
+    )
+
+
+# ============================================================
+# TOOL 5: CONFUSION MATRIX METRICS
+# ============================================================
 
 @server.tool()
 def confusion_matrix_metrics(
@@ -170,74 +286,170 @@ def confusion_matrix_metrics(
     knn_neighbors: int = KnnNeighbors,
     request_id: str = RequestId,
 ) -> Dict[str, Any]:
-    """
-    Compute the confusion matrix plus accuracy/precision/recall for both models
-    on the test set. Precision and recall are for the malignant class.
-    Confusion matrix order is [malignant, benign]; rows = actual, columns = predicted.
-    """
+
+    """Evaluate both models using accuracy, precision and recall."""
+
     def work():
-        ds, lr, knn, source = ml.get_trained_models(test_size, random_state, knn_neighbors)
+
+        ds, lr, knn, source = ml.get_trained_models(
+            test_size,
+            random_state,
+            knn_neighbors
+        )
+
         return {
             "status": "success",
             "model_source": source,
             "positive_class": "malignant",
-            "confusion_matrix_labels": ["malignant", "benign"],
-            "logistic_regression": _metrics(ml.evaluate_model(lr, "logistic_regression", ds)),
-            "knn": _metrics(ml.evaluate_model(knn, "knn", ds)),
+            "confusion_matrix_labels": [
+                "malignant",
+                "benign"
+            ],
+            "logistic_regression": _metrics(
+                ml.evaluate_model(
+                    lr,
+                    "logistic_regression",
+                    ds
+                )
+            ),
+            "knn": _metrics(
+                ml.evaluate_model(
+                    knn,
+                    "knn",
+                    ds
+                )
+            ),
         }
 
-    return _run("confusion_matrix_metrics", request_id, work)
+    return _run(
+        "confusion_matrix_metrics",
+        request_id,
+        work
+    )
 
 
-def _select(test_size, random_state, knn_neighbors, rule):
-    ds, lr, knn, source = ml.get_trained_models(test_size, random_state, knn_neighbors)
+def _select(
+    test_size,
+    random_state,
+    knn_neighbors,
+    rule
+):
+
+    ds, lr, knn, source = ml.get_trained_models(
+        test_size,
+        random_state,
+        knn_neighbors
+    )
+
     selection = ml.select_model(
-        ml.evaluate_model(lr, "logistic_regression", ds),
-        ml.evaluate_model(knn, "knn", ds),
+        ml.evaluate_model(
+            lr,
+            "logistic_regression",
+            ds
+        ),
+        ml.evaluate_model(
+            knn,
+            "knn",
+            ds
+        ),
         rule=rule,
     )
-    model = lr if selection["selected_model"] == "logistic_regression" else knn
+
+    model = (
+        lr
+        if selection["selected_model"] == "logistic_regression"
+        else knn
+    )
+
     return ds, model, selection, source
 
+
+# ============================================================
+# TOOL 6: SELECT BEST MODEL
+# ============================================================
 
 @server.tool()
 def select_best_model(
     rule: str = Field(
         default=DEFAULT_RULE,
-        description="One of: " + ", ".join(ml.SELECTION_RULES) + ". Precision/recall refer to the malignant class.",
+        description=(
+            "One of: "
+            + ", ".join(ml.SELECTION_RULES)
+            + ". Precision/recall refer to the malignant class."
+        ),
     ),
     test_size: float = TestSize,
     random_state: int = RandomState,
     knn_neighbors: int = KnnNeighbors,
     request_id: str = RequestId,
 ) -> Dict[str, Any]:
-    """Select the best model using a rule (default: recall, then precision, then accuracy)."""
+
+    """Select the best model using recall, precision and accuracy."""
+
     def work():
-        _, _, selection, source = _select(test_size, random_state, knn_neighbors, rule)
-        return {"status": "success", "model_source": source, "selection": selection}
+
+        _, _, selection, source = _select(
+            test_size,
+            random_state,
+            knn_neighbors,
+            rule
+        )
+
+        return {
+            "status": "success",
+            "model_source": source,
+            "selection": selection
+        }
 
     return _run(
-        "select_best_model", request_id, work,
-        lambda r: {"selected_model": r["selection"]["selected_model"], "rule": r["selection"]["rule"]},
+        "select_best_model",
+        request_id,
+        work,
+        lambda r: {
+            "selected_model": r["selection"]["selected_model"],
+            "rule": r["selection"]["rule"]
+        },
     )
 
 
+# ============================================================
+# TOOL 7: SHAP EXPLANATIONS
+# ============================================================
+
 @server.tool()
 def shap_explain_selected(
-    local_index: int = Field(default=0, ge=0, description="Test-set row to explain individually."),
-    top_k: int = Field(default=8, ge=1, le=30, description="How many top features to return."),
+    local_index: int = Field(
+        default=0,
+        ge=0,
+        description="Test-set row to explain individually."
+    ),
+    top_k: int = Field(
+        default=8,
+        ge=1,
+        le=30,
+        description="How many top features to return."
+    ),
     test_size: float = TestSize,
     random_state: int = RandomState,
     knn_neighbors: int = KnnNeighbors,
-    selection_rule: str = Field(default=DEFAULT_RULE, description="Rule used to pick the model to explain."),
+    selection_rule: str = Field(
+        default=DEFAULT_RULE,
+        description="Rule used to pick the model to explain."
+    ),
     request_id: str = RequestId,
 ) -> Dict[str, Any]:
-    """
-    Run SHAP for the selected model: global top features plus a local
-    explanation for one test row. Positive SHAP values push toward malignant.
-    """
+
+    """Generate global and local SHAP explanations."""
+
     def work():
-        ds, model, selection, source = _select(test_size, random_state, knn_neighbors, selection_rule)
+
+        ds, model, selection, source = _select(
+            test_size,
+            random_state,
+            knn_neighbors,
+            selection_rule
+        )
+
         explanation = ml.shap_explain(
             model=model,
             model_name=selection["selected_model"],
@@ -245,28 +457,104 @@ def shap_explain_selected(
             local_index=local_index,
             top_k=top_k,
         )
-        return {"status": "success", "model_source": source, "selection": selection, "shap": explanation}
+
+        return {
+            "status": "success",
+            "model_source": source,
+            "selection": selection,
+            "shap": explanation
+        }
 
     return _run(
-        "shap_explain_selected", request_id, work,
-        lambda r: {"model_used": r["selection"]["selected_model"]},
+        "shap_explain_selected",
+        request_id,
+        work,
+        lambda r: {
+            "model_used": r["selection"]["selected_model"]
+        },
     )
 
+
+# ============================================================
+# TOOL 8: EXPORT PARQUET AUDIT
+# ============================================================
 
 @server.tool()
 def export_parquet_audit(
-    filename: str = Field(default="audit_export.parquet", description="Plain file name for the copy, written to data_parquet/."),
+    filename: str = Field(
+        default="audit_export.parquet",
+        description="Plain file name for the copy, written to data_parquet/."
+    ),
     request_id: str = RequestId,
 ) -> Dict[str, Any]:
-    """Export a copy of the Parquet audit log for submission."""
+
+    """Export a copy of the Parquet audit log."""
+
     def work():
-        return {"status": "success", "parquet_path": export_audit_copy(filename)}
+
+        return {
+            "status": "success",
+            "parquet_path": export_audit_copy(filename)
+        }
 
     return _run(
-        "export_parquet_audit", request_id, work,
-        lambda r: {"export_path": r["parquet_path"]},
+        "export_parquet_audit",
+        request_id,
+        work,
+        lambda r: {
+            "export_path": r["parquet_path"]
+        },
     )
 
+
+# ============================================================
+# TOOL 9: PREDICT BOTH MODELS (NEW ASSIGNMENT TOOL)
+# ============================================================
+
+@server.tool()
+def predict_both(
+    input_data: Dict[str, Any] = Field(
+        description=INPUT_DATA_DESCRIPTION
+    ),
+    request_id: str = RequestId,
+) -> Dict[str, Any]:
+
+    """Predict with BOTH models in one call and report whether they agree."""
+
+    def work():
+
+        lr = ml.predict_with_model(
+            ml.load_model("logistic_regression"),
+            input_data
+        )
+
+        knn = ml.predict_with_model(
+            ml.load_model("knn"),
+            input_data
+        )
+
+        return {
+            "status": "success",
+            "logistic_regression": lr["predicted_class"],
+            "knn": knn["predicted_class"],
+            "models_agree": (
+                lr["predicted_class"] == knn["predicted_class"]
+            )
+        }
+
+    return _run(
+        "predict_both",
+        request_id,
+        work,
+        lambda r: {
+            "models_agree": r["models_agree"]
+        },
+    )
+
+
+# ============================================================
+# START MCP SERVER
+# ============================================================
 
 if __name__ == "__main__":
     server.run("stdio")
